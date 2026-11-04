@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from api import source
 from api.catalog import get_catalog
 from api.config import DEFAULT_VERSION, VERSIONS
 from api.jobs import (
@@ -30,6 +31,7 @@ from api.jobs import (
     summary,
 )
 from api.platforms import PlatformError, add_platform, known_names, list_platforms, remove_platform, validate
+from api.source import SourceError
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,8 @@ class CreateRunRequest(BaseModel):
     tags: str | None = None
     parallel: bool = True
     live_screenshots: bool = True
+    # Solo en modo repositorio; vacío = la rama predeterminada.
+    branch: str | None = None
 
 
 def _job_or_404(job_id: str):
@@ -114,13 +118,29 @@ def delete_platform(name: str) -> dict:
     return {"name": name, "removed": True}
 
 
+@app.get("/source")
+def source_info() -> dict:
+    """De dónde salen las pruebas: el repositorio (con sus ramas) o la carpeta local."""
+    if not source.repo_mode():
+        return {"mode": "local", "repo": None, "default_branch": None, "branches": []}
+    try:
+        branches = source.branches()
+        default = source.default_branch([b["name"] for b in branches])
+    except SourceError as e:
+        raise HTTPException(status_code=422, detail=f"No se pudo consultar el repositorio de BaseProject: {e}")
+    return {"mode": "repo", "repo": source.public_repo_url(), "default_branch": default, "branches": branches}
+
+
 @app.get("/catalog")
-def catalog(version: str = DEFAULT_VERSION) -> dict:
-    # Ruta síncrona: el dry-run corre en el threadpool de FastAPI.
+def catalog(version: str = DEFAULT_VERSION, branch: str | None = None) -> dict:
+    # Ruta síncrona: el dry-run (y, la primera vez, preparar la rama) corre en
+    # el threadpool de FastAPI.
     if version not in VERSIONS:
         raise HTTPException(status_code=422, detail=f"versión desconocida: {version}")
     try:
-        return get_catalog(version)
+        return get_catalog(version, branch)
+    except SourceError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.exception("Error generando el catálogo %s", version)
         raise HTTPException(status_code=500, detail=str(e))
@@ -142,6 +162,13 @@ def create_run(body: CreateRunRequest) -> dict:
     bad = [s for s in body.scenarios if not _SCENARIO_RE.match(s) or ".." in s]
     if bad:
         raise HTTPException(status_code=422, detail=f"escenarios inválidos: {', '.join(bad)}")
+    branch = commit = None
+    if source.repo_mode():
+        # El commit se fija ahora: lo que se suba a la rama después no cambia esta corrida.
+        try:
+            branch, commit = source.resolve(body.branch)
+        except SourceError as e:
+            raise HTTPException(status_code=422, detail=str(e))
 
     job_id = submit_run(
         RunParams(
@@ -151,6 +178,8 @@ def create_run(body: CreateRunRequest) -> dict:
             tags=(body.tags or "").strip() or None,
             parallel=body.parallel,
             live_screenshots=body.live_screenshots,
+            branch=branch,
+            commit=commit,
         )
     )
     return {"job_id": job_id, "status": "pending"}
@@ -180,6 +209,8 @@ def runs(
                 "finished_at": j.finished_at.isoformat() if j.finished_at else None,
                 "status": status_label(j),
                 "version": j.params.version,
+                "branch": j.params.branch,
+                "commit": j.params.commit,
                 "platforms": j.params.platforms,
                 "summary": summary(j),
             }
@@ -199,6 +230,7 @@ def get_run(job_id: str) -> dict:
         "job_id": job.id,
         "status": job.status,
         "error": job.error,
+        "phase": job.phase,
         "created_at": job.created_at.isoformat(),
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "params": {
@@ -208,6 +240,8 @@ def get_run(job_id: str) -> dict:
             "tags": job.params.tags,
             "parallel": job.params.parallel,
             "live_screenshots": job.params.live_screenshots,
+            "branch": job.params.branch,
+            "commit": job.params.commit,
         },
         "summary": summary(job, snaps),
         "platforms": snaps,

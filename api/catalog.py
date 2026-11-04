@@ -1,8 +1,8 @@
 """Catálogo de features/escenarios/tags, generado con `cucumber-js --dry-run`.
 
 El dry-run no abre navegador ni corre hooks, tarda unos segundos y además
-marca los pasos sin definir. Se guarda en caché y solo se regenera cuando
-cambia algún archivo de features, steps o pages."""
+marca los pasos sin definir. Se guarda en caché por commit (modo repositorio)
+o hasta que cambia algún archivo de features, steps o pages (modo local)."""
 from __future__ import annotations
 
 import re
@@ -13,39 +13,58 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
-from api.config import BASEPROJECT_DIR
+from api import source
 from api.cucumber import base_env, build_command, feature_files, message_format
 from api.messages import MessageReader
+from api.source import Project
 
-_cache: dict[str, tuple[float, dict]] = {}
+_cache: dict[tuple[str, str], dict] = {}
 _lock = Lock()
 
 
-def _source_mtime() -> float:
+def _source_mtime(project: Path) -> float:
     latest = 0.0
     for sub in ("features", "steps", "pages", "core"):
-        for f in (BASEPROJECT_DIR / "src" / sub).rglob("*"):
+        for f in (project / "src" / sub).rglob("*"):
             if f.suffix in (".feature", ".ts"):
                 latest = max(latest, f.stat().st_mtime)
     return latest
 
 
-def get_catalog(version: str) -> dict:
+def _key(project: Project, version: str) -> tuple[str, str]:
+    return (version, project.commit or f"local:{_source_mtime(project.dir)}")
+
+
+def get_catalog(version: str, branch: str | None = None) -> dict:
+    """Catálogo de la rama pedida (o la predeterminada). En modo local la rama
+    se ignora."""
+    if source.repo_mode():
+        branch, commit = source.resolve(branch)
+        cached = _cache.get((version, commit))
+        if cached:
+            return {**cached, "branch": branch}
+        with source.use(branch, commit) as project:
+            return {**catalog_for(project, version), "branch": branch}
+    with source.use() as project:
+        return catalog_for(project, version)
+
+
+def catalog_for(project: Project, version: str) -> dict:
     with _lock:
-        mtime = _source_mtime()
-        cached = _cache.get(version)
-        if cached and cached[0] == mtime:
-            return cached[1]
-        catalog = _build(version)
-        _cache[version] = (mtime, catalog)
+        key = _key(project, version)
+        cached = _cache.get(key)
+        if cached:
+            return cached
+        catalog = {**_build(project.dir, version), "branch": project.branch, "commit": project.commit}
+        _cache[key] = catalog
         return catalog
 
 
 _PARSE_ERROR_RE = re.compile(r'Parse error in "([^"]+)"')
 
 
-def _build(version: str) -> dict:
-    files = feature_files(version)
+def _build(project_dir: Path, version: str) -> dict:
+    files = feature_files(project_dir, version)
     invalid: list[str] = []
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -57,8 +76,8 @@ def _build(version: str) -> dict:
                 break
             ndjson.unlink(missing_ok=True)
             proc = subprocess.run(
-                build_command([*files, "--dry-run", "--format", message_format(ndjson)]),
-                cwd=BASEPROJECT_DIR,
+                build_command(project_dir, [*files, "--dry-run", "--format", message_format(ndjson)]),
+                cwd=project_dir,
                 env=base_env(version, "catalogo"),
                 capture_output=True,
                 text=True,

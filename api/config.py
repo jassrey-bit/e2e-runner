@@ -14,6 +14,21 @@ load_dotenv(ROOT_DIR / ".env")
 BASEPROJECT_DIR = Path(os.getenv("BASEPROJECT_DIR", str(ROOT_DIR.parent / "BaseProject"))).resolve()
 STORAGE_DIR = ROOT_DIR / "storage" / "runs"
 
+# Repositorio de BaseProject. Si se define, cada corrida baja la rama elegida
+# (como el checkout de GitHub Actions); si no, se usa la carpeta BASEPROJECT_DIR
+# tal como está (modo local, útil para probar cambios sin subirlos).
+REPO_URL = os.getenv("E2E_REPO_URL", "").strip()
+# Token de solo lectura para repos privados por HTTPS. Sin él, git usa las
+# credenciales que ya tenga la máquina.
+REPO_TOKEN = os.getenv("E2E_REPO_TOKEN", "").strip()
+# Rama preseleccionada en la web; vacío = la rama principal del repositorio.
+DEFAULT_BRANCH = os.getenv("E2E_DEFAULT_BRANCH", "").strip()
+SOURCE_DIR = ROOT_DIR / "storage" / "source"
+# Cuántas versiones (commits) preparadas se conservan en disco.
+MAX_CHECKOUTS = int(os.getenv("E2E_MAX_CHECKOUTS", "6"))
+# Hooks propios del runner que se agregan a cada copia (captura en vivo, viewport).
+SUPPORT_DIR = ROOT_DIR / "support"
+
 VERSIONS = ["v2", "v3"]
 DEFAULT_VERSION = os.getenv("E2E_DEFAULT_VERSION", "v2")
 

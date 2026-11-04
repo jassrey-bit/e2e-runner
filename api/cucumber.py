@@ -1,4 +1,6 @@
-"""Cómo se lanza Cucumber dentro de BaseProject y cómo se detiene."""
+"""Cómo se lanza Cucumber dentro de una copia de BaseProject y cómo se detiene.
+`project` es la carpeta preparada por api.source (la rama elegida o la carpeta
+local)."""
 from __future__ import annotations
 
 import os
@@ -8,16 +10,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-from api.config import BASEPROJECT_DIR
-
-CUCUMBER_BIN = BASEPROJECT_DIR / "node_modules" / "@cucumber" / "cucumber" / "bin" / "cucumber.js"
 IS_WINDOWS = sys.platform == "win32"
 
 
-def feature_files(version: str) -> list[str]:
+def feature_files(project: Path, version: str) -> list[str]:
     """Features de cada versión, relativas a BaseProject y con '/'. Igual que
     ejecutar.js: la v2 vive en src/features/v2 y la v3 es todo lo demás."""
-    base = BASEPROJECT_DIR / "src" / "features"
+    base = project / "src" / "features"
     if version == "v2":
         files = (base / "v2").rglob("*.feature")
     else:
@@ -26,7 +25,7 @@ def feature_files(version: str) -> list[str]:
             for f in base.rglob("*.feature")
             if f.relative_to(base).parts[0] not in ("v2", "hybrid")
         )
-    return sorted(f.relative_to(BASEPROJECT_DIR).as_posix() for f in files)
+    return sorted(f.relative_to(project).as_posix() for f in files)
 
 
 def message_format(path: Path) -> str:
@@ -34,13 +33,14 @@ def message_format(path: Path) -> str:
     return f'"message":"{path}"'
 
 
-def build_command(args: list[str]) -> list[str]:
+def build_command(project: Path, args: list[str]) -> list[str]:
     node = shutil.which("node")
     if node is None:
         raise RuntimeError("No se encontró Node.js en el PATH del runner.")
-    if not CUCUMBER_BIN.exists():
-        raise RuntimeError(f"No se encontró Cucumber en {CUCUMBER_BIN}. ¿Corriste npm install en BaseProject?")
-    return [node, str(CUCUMBER_BIN), *args]
+    cucumber_bin = project / "node_modules" / "@cucumber" / "cucumber" / "bin" / "cucumber.js"
+    if not cucumber_bin.exists():
+        raise RuntimeError(f"No se encontró Cucumber en {cucumber_bin}. ¿Faltan las dependencias (npm install)?")
+    return [node, str(cucumber_bin), *args]
 
 
 def base_env(version: str, platform: str) -> dict[str, str]:
@@ -49,8 +49,9 @@ def base_env(version: str, platform: str) -> dict[str, str]:
         {
             "VERSION": version,
             "PLATAFORMA": platform,
-            # hooks.ts lanza Chromium oculto cuando CI=true.
+            # hooks.ts lanza Chromium oculto con CI=true en V2 y con HEADLESS=true en V3.
             "CI": "true",
+            "HEADLESS": "true",
             # Resolución de escritorio para el navegador oculto (live.hooks.ts).
             "E2E_VIEWPORT": os.getenv("E2E_VIEWPORT", "1920x1080"),
             "FORCE_COLOR": "0",
@@ -59,16 +60,20 @@ def base_env(version: str, platform: str) -> dict[str, str]:
     return env
 
 
-def spawn(args: list[str], env: dict[str, str], log_path: Path) -> subprocess.Popen:
+def spawn(project: Path, args: list[str], env: dict[str, str], log_path: Path) -> subprocess.Popen:
+    return spawn_command(build_command(project, args), project, env, log_path)
+
+
+def spawn_command(command: list[str], cwd: Path, env: dict[str, str], log_path: Path) -> subprocess.Popen:
     log = open(log_path, "ab")
-    kwargs: dict = {"cwd": BASEPROJECT_DIR, "env": env, "stdout": log, "stderr": subprocess.STDOUT}
+    kwargs: dict = {"cwd": cwd, "env": env, "stdout": log, "stderr": subprocess.STDOUT}
     # Grupo de procesos propio para poder matar node + todos sus Chromium.
     if IS_WINDOWS:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
     try:
-        return subprocess.Popen(build_command(args), **kwargs)
+        return subprocess.Popen(command, **kwargs)
     finally:
         log.close()
 

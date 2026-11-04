@@ -1,7 +1,8 @@
 """Job store en memoria + ThreadPoolExecutor + metadata.json en disco, mismo
 patrón que los backends de Validación de documentos y Validación de API.
 
-Una corrida (job) ejecuta un proceso de Cucumber por plataforma, en paralelo
+Una corrida (job) primero prepara el código (rama/commit del repositorio, ver
+api.source) y luego ejecuta un proceso de Cucumber por plataforma, en paralelo
 o una tras otra. El avance se calcula leyendo el NDJSON de mensajes que cada
 proceso va escribiendo."""
 from __future__ import annotations
@@ -18,9 +19,11 @@ from pathlib import Path
 from threading import Lock
 
 from api.config import MAX_PARALLEL_RUNS, RETENTION_PERIOD, RUN_TIMEOUT, STORAGE_DIR, secret_values
-from api.catalog import get_catalog
+from api import source
+from api.catalog import catalog_for
 from api.cucumber import base_env, kill_tree, message_format, spawn
 from api.messages import MessageReader
+from api.source import Cancelled, Project, SourceError
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,10 @@ class RunParams:
     tags: str | None = None
     parallel: bool = True
     live_screenshots: bool = True
+    # Modo repositorio: rama elegida y commit exacto (se fija al crear la
+    # corrida; re-ejecutar usa el mismo commit, como "Re-run" en Actions).
+    branch: str | None = None
+    commit: str | None = None
 
 
 @dataclass
@@ -65,6 +72,7 @@ class Job:
     platforms: list[PlatformRun] = field(default_factory=list)
     cancel_requested: bool = False
     # Solo en memoria mientras corre.
+    phase: str | None = None  # qué se está preparando antes de lanzar Cucumber
     readers: dict[str, MessageReader] = field(default_factory=dict, repr=False)
     procs: dict = field(default_factory=dict, repr=False)
 
@@ -86,6 +94,10 @@ class Job:
 
     def ndjson_path(self, name: str) -> Path:
         return self.platform_dir(name) / "messages.ndjson"
+
+    @property
+    def prepare_log_path(self) -> Path:
+        return self.dir / "prepare.log"
 
     @property
     def metadata_path(self) -> Path:
@@ -217,25 +229,25 @@ def submit_run(params: RunParams) -> str:
     return job.id
 
 
-def _cucumber_args(job: Job, platform: str) -> list[str]:
+def _cucumber_args(job: Job, project: Project, platform: str) -> list[str]:
     params = job.params
     # Sin selección = todos los features válidos de la versión (el catálogo ya
     # descartó los que no se pueden leer).
-    targets = params.scenarios or [f["uri"] for f in get_catalog(params.version)["features"]]
+    targets = params.scenarios or [f["uri"] for f in catalog_for(project, params.version)["features"]]
     args = [*targets, "--format", message_format(job.ndjson_path(platform))]
     if params.tags:
         args += ["--tags", params.tags]
     return args
 
 
-def _start_platform(job: Job, run: PlatformRun) -> None:
+def _start_platform(job: Job, project: Project, run: PlatformRun) -> None:
     pdir = job.platform_dir(run.name)
     pdir.mkdir(parents=True, exist_ok=True)
     env = base_env(job.params.version, run.name)
     if job.params.live_screenshots:
         env["E2E_LIVE_DIR"] = str(job.live_dir(run.name))
     job.readers[run.name] = MessageReader(job.ndjson_path(run.name), job.screenshots_dir(run.name), secret_values())
-    job.procs[run.name] = spawn(_cucumber_args(job, run.name), env, job.log_path(run.name))
+    job.procs[run.name] = spawn(project.dir, _cucumber_args(job, project, run.name), env, job.log_path(run.name))
     run.state = "running"
     run.started_at = datetime.now(timezone.utc)
 
@@ -261,61 +273,83 @@ def _finish_platform(job: Job, run: PlatformRun) -> None:
 
 def _run_job(job: Job) -> None:
     deadline = time.monotonic() + RUN_TIMEOUT.total_seconds()
-    queue = list(job.platforms)
     try:
-        while True:
-            running = [p for p in job.platforms if p.state == "running"]
-
-            if job.cancel_requested:
-                for p in running:
-                    kill_tree(job.procs[p.name])
-                for p in queue:
-                    p.state = "cancelled"
-                queue.clear()
-
-            # Lanzar las que tocan: todas de golpe en paralelo, o de una en una.
-            while queue and not job.cancel_requested and (job.params.parallel or not running):
-                p = queue.pop(0)
-                try:
-                    _start_platform(job, p)
-                    running.append(p)
-                except Exception as e:
-                    p.state = "error"
-                    p.error = str(e)
-                if not job.params.parallel:
-                    break
-
-            for p in running:
-                if job.procs[p.name].poll() is not None:
-                    _finish_platform(job, p)
-                    _write_metadata(job)
-
-            if not queue and all(p.state not in ("queued", "running") for p in job.platforms):
-                break
-
-            if time.monotonic() > deadline and not job.cancel_requested:
-                job.cancel_requested = True
-                job.error = f"Se canceló al superar el tiempo máximo ({int(RUN_TIMEOUT.total_seconds() // 60)} min)."
-
-            time.sleep(1)
-
-        if job.cancel_requested:
-            job.status = "cancelled"
-        elif all(p.state == "error" for p in job.platforms):
-            job.status = "error"
-            job.error = job.error or "Ninguna plataforma pudo ejecutarse."
-        else:
-            job.status = "done"
+        with source.use(
+            job.params.branch,
+            job.params.commit,
+            log=job.prepare_log_path,
+            should_stop=lambda: job.cancel_requested,
+            on_phase=lambda message: setattr(job, "phase", message),
+        ) as project:
+            job.phase = None
+            _execute(job, project, deadline)
+    except Cancelled:
+        job.status = "cancelled"
+    except SourceError as e:
+        job.status = "error"
+        job.error = f"No se pudo preparar BaseProject: {e}"
     except Exception as e:
         logger.exception("Error ejecutando el job %s", job.id)
         for proc in job.procs.values():
             kill_tree(proc)
         job.status = "error"
         job.error = f"Error inesperado: {e}"
+    if job.status != "done":
+        for p in job.platforms:
+            if p.state in ("queued", "running"):
+                p.state = "cancelled" if job.status == "cancelled" else "error"
+    job.phase = None
     job.finished_at = datetime.now(timezone.utc)
     job.readers.clear()
     job.procs.clear()
     _write_metadata(job)
+
+
+def _execute(job: Job, project: Project, deadline: float) -> None:
+    queue = list(job.platforms)
+    while True:
+        running = [p for p in job.platforms if p.state == "running"]
+
+        if job.cancel_requested:
+            for p in running:
+                kill_tree(job.procs[p.name])
+            for p in queue:
+                p.state = "cancelled"
+            queue.clear()
+
+        # Lanzar las que tocan: todas de golpe en paralelo, o de una en una.
+        while queue and not job.cancel_requested and (job.params.parallel or not running):
+            p = queue.pop(0)
+            try:
+                _start_platform(job, project, p)
+                running.append(p)
+            except Exception as e:
+                p.state = "error"
+                p.error = str(e)
+            if not job.params.parallel:
+                break
+
+        for p in running:
+            if job.procs[p.name].poll() is not None:
+                _finish_platform(job, p)
+                _write_metadata(job)
+
+        if not queue and all(p.state not in ("queued", "running") for p in job.platforms):
+            break
+
+        if time.monotonic() > deadline and not job.cancel_requested:
+            job.cancel_requested = True
+            job.error = f"Se canceló al superar el tiempo máximo ({int(RUN_TIMEOUT.total_seconds() // 60)} min)."
+
+        time.sleep(1)
+
+    if job.cancel_requested:
+        job.status = "cancelled"
+    elif all(p.state == "error" for p in job.platforms):
+        job.status = "error"
+        job.error = job.error or "Ninguna plataforma pudo ejecutarse."
+    else:
+        job.status = "done"
 
 
 def cancel_job(job_id: str) -> Job | None:
@@ -378,6 +412,8 @@ def platform_snapshot(job: Job, run: PlatformRun) -> dict:
     if meta.exists():
         try:
             live = json.loads(meta.read_text(encoding="utf-8"))
+            for s in secret_values():
+                live["step"] = live.get("step", "").replace(s, "••••••")
         except ValueError:
             live = None
     return {
