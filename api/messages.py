@@ -131,6 +131,16 @@ class MessageReader:
         tc = self.test_cases.get(ev["testCaseId"])
         if tc is None:
             return
+
+        # Un reintento reemplaza al intento anterior del mismo testCase.
+        for sid in list(self.order):
+            if self.started[sid]["test_case_id"] == tc["id"]:
+                self.order.remove(sid)
+
+        self.started[ev["id"]] = {"id": ev["id"], **self._new_scenario(tc)}
+        self.order.append(ev["id"])
+
+    def _new_scenario(self, tc: dict) -> dict:
         pickle = self.pickles.get(tc["pickleId"], {})
         pickle_steps = {s["id"]: s for s in pickle.get("steps", [])}
         uri = pickle.get("uri", "").replace("\\", "/")
@@ -157,13 +167,7 @@ class MessageReader:
                     {"id": ts["id"], "keyword": "", "text": label, "status": "PENDING_RUN", "duration_ms": 0, "hook": True}
                 )
 
-        # Un reintento reemplaza al intento anterior del mismo testCase.
-        for sid in list(self.order):
-            if self.started[sid]["test_case_id"] == tc["id"]:
-                self.order.remove(sid)
-
-        self.started[ev["id"]] = {
-            "id": ev["id"],
+        return {
             "test_case_id": tc["id"],
             "feature": self.features.get(uri, uri),
             "uri": uri,
@@ -175,7 +179,6 @@ class MessageReader:
             "duration_ms": 0,
             "steps": steps,
         }
-        self.order.append(ev["id"])
 
     def _find_step(self, started_id: str, step_id: str) -> dict | None:
         scenario = self.started.get(started_id)
@@ -214,25 +217,33 @@ class MessageReader:
 
     def snapshot(self, *, cancelled: bool = False) -> dict:
         with self._lock:
+            # Todos los escenarios de la corrida, también los que aún no empiezan.
+            # El id es el del testCase: se conserva cuando empieza o se reintenta.
+            started = {self.started[sid]["test_case_id"]: self.started[sid] for sid in self.order}
+            current_id = next(
+                (self.started[sid]["test_case_id"] for sid in reversed(self.order) if not self.started[sid]["finished"]),
+                None,
+            )
             scenarios = []
-            for sid in self.order:
-                sc = dict(self.started[sid])
+            for tc_id, tc in self.test_cases.items():
+                sc = dict(started.get(tc_id) or self._new_scenario(tc))
                 sc["steps"] = [dict(s) for s in sc["steps"]]
+                if tc_id not in started:
+                    sc["status"] = "PENDING_RUN"
                 if cancelled and not sc["finished"]:
                     sc["status"] = "CANCELLED"
                     for s in sc["steps"]:
                         if s["status"] in ("RUNNING", "PENDING_RUN"):
                             s["status"] = "CANCELLED"
-                sc.pop("test_case_id", None)
+                sc["id"] = sc.pop("test_case_id")
                 scenarios.append(sc)
 
             finished = [s for s in scenarios if s["finished"]]
-            current = next((s for s in reversed(scenarios) if not s["finished"]), None)
             return {
                 "total": len(self.test_cases),
                 "finished": len(finished),
                 "passed": sum(1 for s in finished if s["status"] == "PASSED"),
                 "failed": sum(1 for s in finished if s["status"] != "PASSED"),
-                "current_scenario_id": current["id"] if current and not cancelled else None,
+                "current_scenario_id": None if cancelled else current_id,
                 "scenarios": scenarios,
             }
